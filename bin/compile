@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir> <env-dir>
+
+# Ensure wildcards in globs match dotfiles too.
+shopt -s dotglob
+
+BUILD_DIR="$1"
+CACHE_DIR="$2"
+ENV_DIR="$3"
+STAGE="$(mktemp -d)"
+BP_DIR=$(cd "$(dirname "${0:-}")"; cd ..; pwd)
+
+source "$BP_DIR/lib/output.sh"
+source "$BP_DIR/lib/environment.sh"
+
+### CHECKING AND SETTING CONFIG VARIABLES
+
+# PACKAGE_NAME
+# The name of the package, how it would be named when published to NPM, e.g. @scope/package, or reference it as a dependency.
+# This is used for the "lerna run build" command, to scope the building to the specific package and its dependencies
+# to speed up the build 
+if [ ! -f "${ENV_DIR}/PACKAGE_NAME" ]; then
+    echo "PACKAGE_NAME was not set. Aborting" | indent
+    exit 1
+fi
+PACKAGE_NAME="$(cat "${ENV_DIR}/PACKAGE_NAME")"
+
+# PACKAGE_PATH
+# The path inside your repository, where the packages lay. If not set, will be automatically set to "packages"
+if [ ! -f "${ENV_DIR}/PACKAGE_PATH" ]; then
+    echo "PACKAGE_PATH was not set. Value will be set to packages" | indent
+    PACKAGE_PATH="packages"
+else
+    PACKAGE_PATH="$(cat "${ENV_DIR}/PACKAGE_PATH")"
+fi
+
+# PACKAGE_SUBFOLDER_NAME
+# The actual foldername of the sub folder inside the package directory in your repository.
+# Don't miskae this for the package name, how it would be referenced as a dependency
+# If you have the following folder structure:
+# root
+# root/packages
+# root/packages/example1
+# Then PACKAGE_SUBFOLDER_NAME should be example1
+if [ ! -f "${ENV_DIR}/PACKAGE_SUBFOLDER_NAME" ]; then
+    echo "PACKAGE_SUBFOLDER_NAME was not set. Aborting" | indent
+    exit 1
+fi
+PACKAGE_SUBFOLDER_NAME="$(cat "${ENV_DIR}/PACKAGE_SUBFOLDER_NAME")"
+
+# PACKAGE_REQUIRED_DEPENDENCIES
+# The required local dependencies, which need to be resolved to be able to build and run
+# the package specified in PACKAGE_NAME 
+if [ ! -f "${ENV_DIR}/PACKAGE_REQUIRED_DEPENDENCIES" ]; then
+    echo "PACKAGE_REQUIRED_DEPENDENCIES was not set. Value will be set to none" | indent
+    PACKAGE_REQUIRED_DEPENDENCIES=""
+else
+    PACKAGE_REQUIRED_DEPENDENCIES="$(cat "${ENV_DIR}/PACKAGE_REQUIRED_DEPENDENCIES")"
+fi
+
+
+# SETUP
+export_env_dir "$ENV_DIR"
+write_profile "$BP_DIR" "$BUILD_DIR"
+
+# START BUILDING PROCESS
+header "Building package: ${PACKAGE_NAME} (in ${PACKAGE_PATH}/${PACKAGE_SUBFOLDER_NAME})"
+
+cd "${BUILD_DIR}"
+
+# INSTALLING
+header "Installing dependencies (lerna bootstrap --ci)"
+npm ci && lerna bootstrap --ci 2>&1 | output
+
+# BUILDING
+header "Build ${PACKAGE_NAME} and its dependencies"
+lerna run build --scope="${PACKAGE_NAME}" --include-dependencies --stream 2>&1 | output
+
+# LINKING
+header "Link dependencies of ${PACKAGE_NAME}"
+lerna link --force-local
+
+cd - 
+
+header "Clean build directory and hook up dependencies of ${PACKAGE_NAME}"
+
+# MOVING AND CLEAN UP
+mv -T "${BUILD_DIR}/$PACKAGE_PATH/$PACKAGE_SUBFOLDER_NAME" "${STAGE}"
+
+# COPY PACKAGES
+# Lerna produces symlinks, but we have to manually copy over the packages
+
+for packageInformation in ${PACKAGE_REQUIRED_DEPENDENCIES//,/ }
+do
+  echo "${packageInformation}"
+
+  singlePackageInformation=(${packageInformation//;/ })
+
+  packageName="${singlePackageInformation[0]}";
+  folderName="${singlePackageInformation[1]}";
+
+  rm -rf "${STAGE}/node_modules/${packageName}"
+  mv -T "${BUILD_DIR}/$PACKAGE_PATH/${folderName}" "${STAGE}/node_modules/${packageName}"
+done
+
+# MOVE AND CLEAN UP
+
+mv "${BUILD_DIR}/.heroku" "${STAGE}/.heroku"
+
+mv "${BUILD_DIR}/.profile.d" "${STAGE}/.profile.d"
+
+rm -rf "${BUILD_DIR}"/* &&
+
+mv -T "${STAGE}" "${BUILD_DIR}"
+
+# mv "${STAGE}/.heroku" "${BUILD_DIR}/.heroku"
+
+# mv "${STAGE}/.profile.d" "${BUILD_DIR}/.profile.d"
+
+# FINISHED
+if [ $? -ne 0 ]; then
+    echo "FAILED to copy directory into place" | indent
+    exit 1
+fi
+
+header "Finalized building ${PACKAGE_NAME}"
